@@ -15,7 +15,7 @@ NIM, or a local Ollama model from the settings panel.
 │   topic states       │   scores + ring      │
 └─────────────────────┴─────────────────────┘
 ```
-
+## NOTE: HELP OF AI MODELS IS TAKEN FOR CREATION, (still in development, bugs exists)
 ## Quick start
 
 **1. Backend**

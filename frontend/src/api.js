@@ -1,112 +1,83 @@
+const BASE_URL = "http://127.0.0.1:8000";
 
-// api.js — All HTTP calls to the FastAPI backend
-// Pattern: Centralized API client — one file, all endpoints
-
-const API_BASE = "http://localhost:8000";
-
-async function fetchJson(path, options = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
+async function handle(resp) {
+  if (!resp.ok) {
+    let detail = resp.statusText;
+    try {
+      const body = await resp.json();
+      detail = body.detail || JSON.stringify(body);
+    } catch {
+      // ignore — keep statusText
+    }
+    const err = new Error(detail);
+    err.status = resp.status;
+    throw err;
   }
-  return res.json();
+  return resp.json();
 }
 
-// ─── Sessions ───
-export const startSession = (userId) =>
-  fetchJson("/session/start", {
+export async function startSession({ userId, name }) {
+  const resp = await fetch(`${BASE_URL}/session/start`, {
     method: "POST",
-    body: JSON.stringify({ user_id: userId }),
-  });
-
-// ─── Chat ───
-export const sendChat = (userId, sessionId, message) =>
-  fetchJson("/chat", {
-    method: "POST",
-    body: JSON.stringify({ user_id: userId, session_id: sessionId, message }),
-  });
-
-// ─── Code Execution ───
-export const runCode = (code) =>
-  fetchJson("/code/run", {
-    method: "POST",
-    body: JSON.stringify({ code }),
-  });
-
-// ─── Progress & Curriculum ───
-export const getProgress = (userId) => fetchJson(`/progress/${userId}`);
-export const getCurriculum = (userId) => fetchJson(`/curriculum/${userId}`);
-
-// ─── Settings ───
-export const loadSettings = () => fetchJson("/settings/load");
-export const saveSettings = (settings) =>
-  fetchJson("/settings/save", {
-    method: "POST",
-    body: JSON.stringify(settings),
-  });
-export const testSettings = () =>
-  fetchJson("/settings/test", { method: "POST" });
-
-
-
-api_js = """// api.js — All HTTP calls to the FastAPI backend
-// Pattern: Centralized API client — one file, all endpoints
-
-const API_BASE = "http://localhost:8000";
-
-async function fetchJson(path, options = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
-    ...options,
+    body: JSON.stringify({ user_id: userId ?? null, name: name ?? "Learner" }),
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
-  }
-  return res.json();
+  return handle(resp);
 }
 
-// Sessions
-export const startSession = (userId) =>
-  fetchJson("/session/start", {
+export async function sendChat({ userId, sessionId, message, mode, codeContext }) {
+  const resp = await fetch(`${BASE_URL}/chat`, {
     method: "POST",
-    body: JSON.stringify({ user_id: userId }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_id: userId,
+      session_id: sessionId,
+      message,
+      mode,
+      code_context: codeContext ?? null,
+    }),
   });
+  return handle(resp);
+}
 
-// Chat
-export const sendChat = (userId, sessionId, message) =>
-  fetchJson("/chat", {
+export async function getProgress(userId) {
+  const resp = await fetch(`${BASE_URL}/progress/${userId}`);
+  return handle(resp);
+}
+
+export async function getCurriculum(userId) {
+  const resp = await fetch(`${BASE_URL}/curriculum/${userId}`);
+  return handle(resp);
+}
+
+export async function runCode(code) {
+  const resp = await fetch(`${BASE_URL}/code/run`, {
     method: "POST",
-    body: JSON.stringify({ user_id: userId, session_id: sessionId, message }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code, timeout_seconds: 8 }),
   });
+  return handle(resp);
+}
 
-// Code Execution
-export const runCode = (code) =>
-  fetchJson("/code/run", {
+export async function loadSettings() {
+  const resp = await fetch(`${BASE_URL}/settings/load`);
+  return handle(resp);
+}
+
+export async function saveSettings(payload) {
+  const resp = await fetch(`${BASE_URL}/settings/save`, {
     method: "POST",
-    body: JSON.stringify({ code }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
+  return handle(resp);
+}
 
-// Progress & Curriculum
-export const getProgress = (userId) => fetchJson(`/progress/${userId}`);
-export const getCurriculum = (userId) => fetchJson(`/curriculum/${userId}`);
-
-// Settings
-export const loadSettings = () => fetchJson("/settings/load");
-export const saveSettings = (settings) =>
-  fetchJson("/settings/save", {
+export async function testSettings(provider) {
+  const resp = await fetch(`${BASE_URL}/settings/test`, {
     method: "POST",
-    body: JSON.stringify(settings),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider }),
   });
-export const testSettings = () =>
-  fetchJson("/settings/test", { method: "POST" });
-"""
-
-with open("pytutor/frontend/src/api.js", "w") as f:
-    f.write(api_js)
-
-print("✅ api.js written")
+  return handle(resp);
+}

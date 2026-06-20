@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  @apply bg-void text-ink font-body;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2A2F3A;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #38404E;
+}
+
+/* Signature element: a thin animated signal trace along the top edge of
+   whichever panel currently has the AI's attention. Two-tone gradient
+   so it reads as a moving pulse, not a static stripe. */
+.panel-active::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    #f0a84b,
+    #4fd1ae,
+    transparent
+  );
+  background-size: 200% 100%;
+  animation: signal 2.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-active::before {
+    animation: none;
+    background: linear-gradient(90deg, #f0a84b, #4fd1ae);
+  }
+}
+
+:focus-visible {
+  outline: 2px solid #f0a84b;
+  outline-offset: 2px;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+}
+
+.monaco-highlight-line {
+  background: rgba(240, 168, 75, 0.12);
+  border-left: 2px solid #f0a84b;
+}
+.monaco-highlight-glyph {
+  background: #f0a84b;
+  width: 4px !important;
+  margin-left: 3px;
+}

@@ -1,117 +1,119 @@
+"""Pydantic data models for PyTutor AI.
 
-models_code = '''"""
-models.py — Pydantic data models for PyTutor AI
-
-Every piece of data that crosses the API boundary gets validated here.
-This prevents garbage data from entering the database or reaching the frontend.
+These mirror the JSON contract the AI is instructed to respond with
+(see prompts.py) plus the request/response shapes for the API routes.
 """
+from __future__ import annotations
 
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
-from typing import Literal, Optional
-from datetime import datetime
 
 
-# ───────────────────────────────────────────────
-# REQUEST MODELS (what the frontend sends us)
-# ───────────────────────────────────────────────
-
-class ChatRequest(BaseModel):
-    """User sends a message to the AI."""
-    user_id: int
-    session_id: int
-    message: str
-
-
-class CodeRunRequest(BaseModel):
-    """User wants to execute Python code."""
-    code: str
-
-
-class SettingsSaveRequest(BaseModel):
-    """User saves their AI provider settings."""
-    provider: Literal["claude", "openai", "gemini", "nvidia", "local"]
-    api_key: str = Field(default="", description="API key for the provider")
-    model: str = Field(default="", description="Model name/tier")
-    local_url: str = Field(default="", description="Ollama server URL if local")
-
-
-class StartSessionRequest(BaseModel):
-    """Start or resume a session."""
-    user_id: int
-
-
-# ───────────────────────────────────────────────
-# RESPONSE MODELS (what we send back)
-# ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# AI response contract (what the model must return, parsed from its JSON)
+# ---------------------------------------------------------------------------
 
 class Quiz(BaseModel):
-    """A multiple-choice or fill-in-the-blank question."""
     question: str
-    options: list[str]
-    correct: str
-    explanation: str
-
-
-class Resource(BaseModel):
-    """External learning resource link."""
-    label: str
-    url: str
-    type: Literal["article", "video", "doc", "interactive"]
+    options: List[str] = Field(default_factory=list)
+    correct: str = ""
+    explanation: str = ""
 
 
 class CurriculumUpdate(BaseModel):
-    """AI wants to modify the user's curriculum."""
     add_topic: Optional[str] = None
     remove_topic: Optional[str] = None
-    reorder: Optional[list[str]] = None
+    reorder: Optional[List[str]] = None
     reason: Optional[str] = None
 
 
 class ProgressUpdate(BaseModel):
-    """AI wants to update the user's skill score."""
     topic: str
-    score: int = Field(ge=0, le=100, description="Score between 0 and 100")
+    score: int = Field(ge=0, le=100)
+
+
+class Resource(BaseModel):
+    label: str
+    url: str
+    type: Literal["article", "video", "docs", "other"] = "other"
 
 
 class AIResponse(BaseModel):
-    """
-    The AI's structured response. Every field is optional except message.
-    The frontend reads each field and decides what UI action to take.
-    """
-    message: str = Field(description="Explanation shown in teaching panel")
-    action: Optional[Literal["write_code", "create_quiz", "explain", "review_code", "ask_question"]] = None
-    code: Optional[str] = Field(default=None, description="Python code to inject into editor")
+    """The structured contract every AI turn must satisfy."""
+    message: str = ""
+    action: Literal[
+        "write_code", "create_quiz", "explain", "review_code", "ask_question"
+    ] = "explain"
+    code: Optional[str] = None
     run_code: bool = False
-    highlight_lines: Optional[list[int]] = None
+    highlight_lines: List[int] = Field(default_factory=list)
     quiz: Optional[Quiz] = None
     curriculum_update: Optional[CurriculumUpdate] = None
     progress_update: Optional[ProgressUpdate] = None
-    resources: Optional[list[Resource]] = None
+    resources: List[Resource] = Field(default_factory=list)
 
 
-class SessionResponse(BaseModel):
-    """Response when starting or resuming a session."""
-    session_id: int
-    topic: str
-    messages: list[dict]
-    progress: list[dict]
+# ---------------------------------------------------------------------------
+# API request/response shapes
+# ---------------------------------------------------------------------------
+
+class SessionStartRequest(BaseModel):
+    user_id: Optional[int] = None
+    name: Optional[str] = "Learner"
 
 
-class ProgressResponse(BaseModel):
-    """User's learning progress."""
+class SessionStartResponse(BaseModel):
     user_id: int
-    topics: list[dict]
+    session_id: int
+    topic: Optional[str]
+    messages: list
+    curriculum: list
+    progress: list
+
+
+class ChatRequest(BaseModel):
+    user_id: int
+    session_id: int
+    message: str
+    mode: Literal["TEACH", "QUIZ", "REVIEW", "INTERVIEW", "EXPLAIN"] = "TEACH"
+    code_context: Optional[str] = None  # current editor contents, for REVIEW mode
+
+
+class ChatResponse(BaseModel):
+    ai: AIResponse
+    raw: Optional[str] = None  # raw text, only populated if JSON parsing failed
+
+
+class CodeRunRequest(BaseModel):
+    code: str
+    timeout_seconds: int = 8
 
 
 class CodeRunResponse(BaseModel):
-    """Result of executing Python code."""
     stdout: str
     stderr: str
-    returncode: int
-'''
+    timed_out: bool = False
+    exit_code: Optional[int] = None
 
-with open("pytutor/backend/models.py", "w") as f:
-    f.write(models_code)
 
-print("✅ models.py written")
-print(f"Size: {len(models_code)} characters")
+class ProviderSettings(BaseModel):
+    api_key: Optional[str] = ""
+    model: Optional[str] = ""
+
+
+class OllamaSettings(BaseModel):
+    base_url: str = "http://localhost:11434"
+    model: str = "llama3.1"
+
+
+class SettingsPayload(BaseModel):
+    provider: Literal["claude", "openai", "gemini", "nvidia", "local"] = "claude"
+    claude: ProviderSettings = Field(default_factory=ProviderSettings)
+    openai: ProviderSettings = Field(default_factory=ProviderSettings)
+    gemini: ProviderSettings = Field(default_factory=ProviderSettings)
+    nvidia: ProviderSettings = Field(default_factory=ProviderSettings)
+    local: OllamaSettings = Field(default_factory=OllamaSettings)
+
+
+class SettingsTestRequest(BaseModel):
+    provider: Literal["claude", "openai", "gemini", "nvidia", "local"]

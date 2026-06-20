@@ -1,255 +1,197 @@
-
-ai_provider_code = '''"""
-ai_provider.py — Adapter for multiple AI providers
-
-Pattern: Adapter Pattern
-- One common interface: chat(messages, system_prompt)
-- Multiple implementations hidden behind it
-- Swap providers by changing one setting
+"""Adapter that routes a chat turn to whichever provider is active in
+settings.json, and normalizes every provider's reply down to plain text
+so the rest of the app never has to know which one answered.
 """
+from __future__ import annotations
 
-import os
 import json
-import requests
-from typing import List, Dict
+import re
+from typing import Any, Dict, List, Optional
 
-# Load settings from our settings module (we'll build this next)
+import httpx
+
 from settings import load_settings
 
+TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
-def chat(messages: List[Dict[str, str]], system_prompt: str) -> str:
-    """
-    Send a conversation to the configured AI provider and return the response text.
-    
-    Args:
-        messages: List of {"role": "user"|"assistant", "content": "..."}
-        system_prompt: The system instructions for the AI
-    
-    Returns:
-        Raw text response from the AI (expected to be JSON)
-    """
-    settings = load_settings()
-    provider = settings.get("provider", "claude")
-    
-    # Route to the correct adapter
+
+class ProviderError(Exception):
+    """Raised when a provider call fails (bad key, network, bad response)."""
+
+
+async def chat(messages: List[Dict[str, str]], system_prompt: str,
+                provider_override: Optional[str] = None) -> str:
+    """messages: [{"role": "user"|"assistant", "content": "..."}]
+    Returns the raw text reply from the model (expected to be JSON, but
+    that's parsed by the caller via parse_ai_json)."""
+    cfg = load_settings()
+    provider = provider_override or cfg["provider"]
+
     if provider == "claude":
-        return _chat_claude(messages, system_prompt, settings)
-    elif provider == "openai":
-        return _chat_openai(messages, system_prompt, settings)
-    elif provider == "gemini":
-        return _chat_gemini(messages, system_prompt, settings)
-    elif provider == "nvidia":
-        return _chat_nvidia(messages, system_prompt, settings)
-    elif provider == "local":
-        return _chat_ollama(messages, system_prompt, settings)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+        return await _chat_claude(messages, system_prompt, cfg["claude"])
+    if provider == "openai":
+        return await _chat_openai(messages, system_prompt, cfg["openai"])
+    if provider == "gemini":
+        return await _chat_gemini(messages, system_prompt, cfg["gemini"])
+    if provider == "nvidia":
+        return await _chat_nvidia(messages, system_prompt, cfg["nvidia"])
+    if provider == "local":
+        return await _chat_ollama(messages, system_prompt, cfg["local"])
+    raise ProviderError(f"Unknown provider: {provider}")
 
 
-# ───────────────────────────────────────────────
-# CLAUDE (Anthropic Messages API)
-# ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Provider implementations
+# ---------------------------------------------------------------------------
 
-def _chat_claude(messages, system_prompt, settings):
-    """
-    Anthropic Messages API — 2026 format
-    Endpoint: POST https://api.anthropic.com/v1/messages
-    Auth: x-api-key header
-    Model: claude-sonnet-4-6 (current best balance of speed + intelligence)
-    """
-    api_key = settings.get("api_key", "")
-    model = settings.get("model", "claude-sonnet-4-6")
-    
-    if not api_key:
-        raise ValueError("Claude API key not configured. Go to Settings.")
-    
-    # Anthropic uses "system" as a top-level param, not in messages array
-    payload = {
-        "model": model,
-        "max_tokens": 4096,
-        "system": system_prompt,
-        "messages": messages,
-    }
-    
-    response = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    
-    # Claude returns content as a list of blocks; text is in .content[0].text
-    return data["content"][0]["text"]
+async def _chat_claude(messages, system_prompt, cfg) -> str:
+    if not cfg.get("api_key"):
+        raise ProviderError("No Claude API key set. Add one in Settings.")
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": cfg["api_key"],
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": cfg.get("model") or "claude-sonnet-4-6",
+                "max_tokens": 2000,
+                "system": system_prompt,
+                "messages": messages,
+            },
+        )
+    _raise_for_status(resp, "Claude")
+    data = resp.json()
+    parts = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+    return "\n".join(parts)
 
 
-# ───────────────────────────────────────────────
-# OPENAI (Chat Completions API)
-# ───────────────────────────────────────────────
-
-def _chat_openai(messages, system_prompt, settings):
-    """
-    OpenAI Chat Completions API — 2026 format
-    Endpoint: POST https://api.openai.com/v1/chat/completions
-    Auth: Authorization: Bearer {key}
-    Model: gpt-5.5 (current as of 2026)
-    """
-    api_key = settings.get("api_key", "")
-    model = settings.get("model", "gpt-5.5")
-    
-    if not api_key:
-        raise ValueError("OpenAI API key not configured. Go to Settings.")
-    
-    # OpenAI puts system prompt in the messages array
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
-    
-    payload = {
-        "model": model,
-        "messages": full_messages,
-        "max_tokens": 4096,
-    }
-    
-    response = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    
-    # OpenAI returns choices[0].message.content
+async def _chat_openai(messages, system_prompt, cfg) -> str:
+    if not cfg.get("api_key"):
+        raise ProviderError("No OpenAI API key set. Add one in Settings.")
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {cfg['api_key']}"},
+            json={
+                "model": cfg.get("model") or "gpt-4o",
+                "messages": [{"role": "system", "content": system_prompt}, *messages],
+                "response_format": {"type": "json_object"},
+            },
+        )
+    _raise_for_status(resp, "OpenAI")
+    data = resp.json()
     return data["choices"][0]["message"]["content"]
 
 
-# ───────────────────────────────────────────────
-# GEMINI (Google Generative Language API)
-# ───────────────────────────────────────────────
-
-def _chat_gemini(messages, system_prompt, settings):
-    """
-    Google Gemini API
-    Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
-    Auth: key={api_key} as query param
-    """
-    api_key = settings.get("api_key", "")
-    model = settings.get("model", "gemini-2.5-pro")
-    
-    if not api_key:
-        raise ValueError("Gemini API key not configured. Go to Settings.")
-    
-    # Gemini format: contents array with role "user" or "model"
-    contents = []
-    for msg in messages:
-        role = "model" if msg["role"] == "assistant" else msg["role"]
-        contents.append({
-            "role": role,
-            "parts": [{"text": msg["content"]}]
-        })
-    
-    payload = {
-        "contents": contents,
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-    }
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    
-    response = requests.post(
-        url,
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    
-    # Gemini returns candidates[0].content.parts[0].text
+async def _chat_gemini(messages, system_prompt, cfg) -> str:
+    if not cfg.get("api_key"):
+        raise ProviderError("No Gemini API key set. Add one in Settings.")
+    model = cfg.get("model") or "gemini-1.5-pro"
+    contents = [
+        {"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
+        for m in messages
+    ]
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            params={"key": cfg["api_key"]},
+            json={
+                "system_instruction": {"parts": [{"text": system_prompt}]},
+                "contents": contents,
+                "generationConfig": {"response_mime_type": "application/json"},
+            },
+        )
+    _raise_for_status(resp, "Gemini")
+    data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-# ───────────────────────────────────────────────
-# NVIDIA NIM (OpenAI-compatible)
-# ───────────────────────────────────────────────
-
-def _chat_nvidia(messages, system_prompt, settings):
-    """
-    NVIDIA NIM API — OpenAI-compatible format
-    Endpoint: POST https://integrate.api.nvidia.com/v1/chat/completions
-    Auth: Authorization: Bearer {key}
-    """
-    api_key = settings.get("api_key", "")
-    model = settings.get("model", "nvidia/llama-3.1-nemotron-70b")
-    
-    if not api_key:
-        raise ValueError("NVIDIA API key not configured. Go to Settings.")
-    
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
-    
-    payload = {
-        "model": model,
-        "messages": full_messages,
-        "max_tokens": 4096,
-    }
-    
-    response = requests.post(
-        "https://integrate.api.nvidia.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    
+async def _chat_nvidia(messages, system_prompt, cfg) -> str:
+    if not cfg.get("api_key"):
+        raise ProviderError("No NVIDIA NIM API key set. Add one in Settings.")
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.post(
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {cfg['api_key']}"},
+            json={
+                "model": cfg.get("model") or "meta/llama-3.1-70b-instruct",
+                "messages": [{"role": "system", "content": system_prompt}, *messages],
+            },
+        )
+    _raise_for_status(resp, "NVIDIA NIM")
+    data = resp.json()
     return data["choices"][0]["message"]["content"]
 
 
-# ───────────────────────────────────────────────
-# LOCAL / OLLAMA
-# ───────────────────────────────────────────────
-
-def _chat_ollama(messages, system_prompt, settings):
-    """
-    Ollama local API — no API key needed
-    Endpoint: POST http://localhost:11434/api/chat
-    """
-    local_url = settings.get("local_url", "http://localhost:11434")
-    model = settings.get("model", "llama3.1")
-    
-    # Ollama uses "system" message in the messages array
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
-    
-    payload = {
-        "model": model,
-        "messages": full_messages,
-        "stream": False,
-    }
-    
-    response = requests.post(
-        f"{local_url}/api/chat",
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=120,  # Local models can be slower
-    )
-    response.raise_for_status()
-    data = response.json()
-    
-    # Ollama returns message.content
+async def _chat_ollama(messages, system_prompt, cfg) -> str:
+    base_url = (cfg.get("base_url") or "http://localhost:11434").rstrip("/")
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        try:
+            resp = await client.post(
+                f"{base_url}/api/chat",
+                json={
+                    "model": cfg.get("model") or "llama3.1",
+                    "messages": [{"role": "system", "content": system_prompt}, *messages],
+                    "stream": False,
+                    "format": "json",
+                },
+            )
+        except httpx.ConnectError as e:
+            raise ProviderError(
+                f"Couldn't reach Ollama at {base_url}. Is it running? ({e})"
+            ) from e
+    _raise_for_status(resp, "Ollama")
+    data = resp.json()
     return data["message"]["content"]
-'''
 
-with open("pytutor/backend/ai_provider.py", "w") as f:
-    f.write(ai_provider_code)
 
-print("✅ ai_provider.py written")
-print(f"Size: {len(ai_provider_code)} characters")
+def _raise_for_status(resp: httpx.Response, provider_name: str) -> None:
+    if resp.status_code >= 400:
+        detail = resp.text[:500]
+        raise ProviderError(f"{provider_name} returned {resp.status_code}: {detail}")
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing safety net
+# ---------------------------------------------------------------------------
+
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+
+def parse_ai_json(raw: str) -> Dict[str, Any]:
+    """Models occasionally wrap JSON in markdown fences or add stray text
+    despite instructions. Strip the common cases before giving up."""
+    text = raw.strip()
+    text = _FENCE_RE.sub("", text).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Last resort: grab the largest {...} span in the text.
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    raise ProviderError("AI did not return valid JSON.")
+
+
+async def test_provider(provider: str) -> Dict[str, Any]:
+    """Fire a tiny test request against the given provider. Used by
+    POST /settings/test."""
+    try:
+        reply = await chat(
+            messages=[{"role": "user", "content": 'Reply with exactly: {"message": "ok", "action": "explain"}'}],
+            system_prompt="You are a connectivity test. Reply with strictly valid JSON, nothing else.",
+            provider_override=provider,
+        )
+        parse_ai_json(reply)
+        return {"ok": True, "detail": "Connected successfully."}
+    except ProviderError as e:
+        return {"ok": False, "detail": str(e)}
+    except Exception as e:  # noqa: BLE001 - surface any unexpected failure to the UI
+        return {"ok": False, "detail": f"Unexpected error: {e}"}

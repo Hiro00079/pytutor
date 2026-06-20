@@ -1,221 +1,272 @@
+"""SQLite setup and queries for PyTutor AI.
 
-# Let's write the database layer
+Three tables, as specified in the project brief:
+  users      — who is learning
+  sessions   — full conversation history per session, replayed for memory
+  progress   — per-topic skill score / completion
 
-db_code = '''"""
-database.py — All SQLite operations for PyTutor AI
-
-Pattern: Repository Pattern
-- Every database operation is a function here
-- No other file writes raw SQL
-- This makes testing easy: swap this file for a mock
+Plus a fourth, `curriculum`, which the brief's API surface implies
+(GET /curriculum/{user_id}) but doesn't fully spell out — modeled here
+as an ordered, per-user topic list with a locked/active/done state.
 """
+from __future__ import annotations
 
-import sqlite3
 import json
-from datetime import datetime
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-# Path to the database file — one level up from backend/, then into data/
-DB_PATH = Path(__file__).parent.parent / "data" / "pytutor.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "pytutor.db"
+
+DEFAULT_CURRICULUM = [
+    "Variables & Data Types",
+    "Control Flow",
+    "Functions",
+    "Lists & Dictionaries",
+    "Comprehensions",
+    "OOP Basics",
+    "Error Handling",
+    "Modules & Packages",
+    "File I/O",
+    "Iterators & Generators",
+    "Decorators",
+    "Testing Basics",
+]
 
 
-def get_connection():
-    """Create a connection with row factory for dict-like access."""
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@contextmanager
+def get_conn():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # Lets you access columns by name: row["name"]
-    return conn
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def init_db():
-    """
-    Create all tables. Safe to call multiple times — CREATE TABLE IF NOT EXISTS
-    handles duplicates gracefully.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
+def init_db() -> None:
+    with get_conn() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
 
-    cursor.executescript("""
-        -- Who is learning
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                topic TEXT,
+                messages TEXT NOT NULL DEFAULT '[]',
+                started_at TEXT NOT NULL,
+                last_active TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
 
-        -- Every conversation, stored for memory
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            topic TEXT,
-            messages TEXT,           -- Full conversation as JSON string
-            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
+            CREATE TABLE IF NOT EXISTS progress (
+                user_id INTEGER NOT NULL,
+                topic_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'not_started',
+                score INTEGER NOT NULL DEFAULT 0,
+                last_updated TEXT NOT NULL,
+                PRIMARY KEY (user_id, topic_name)
+            );
 
-        -- Skill tracking per topic
-        CREATE TABLE IF NOT EXISTS progress (
-            user_id INTEGER NOT NULL,
-            topic_name TEXT NOT NULL,
-            status TEXT DEFAULT 'not_started',  -- 'not_started' | 'in_progress' | 'completed'
-            score INTEGER DEFAULT 0,             -- 0-100
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (user_id, topic_name)
-        );
-    """)
-
-    conn.commit()
-    conn.close()
-    print("✅ Database initialized at", DB_PATH)
+            CREATE TABLE IF NOT EXISTS curriculum (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                topic_name TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'locked'
+            );
+            """
+        )
 
 
-# ───────────────────────────────────────────────
-# USERS
-# ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
 
-def create_user(name: str) -> int:
-    """Create a new user. Returns the user_id."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (name) VALUES (?)", (name,))
-    user_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return user_id
-
-
-def get_user(user_id: int) -> dict | None:
-    """Get user by ID. Returns None if not found."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return dict(row) if row else None
+def get_or_create_user(user_id: Optional[int], name: str = "Learner") -> sqlite3.Row:
+    with get_conn() as conn:
+        if user_id is not None:
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            if row:
+                return row
+        cur = conn.execute(
+            "INSERT INTO users (name, created_at) VALUES (?, ?)", (name, _now())
+        )
+        new_id = cur.lastrowid
+        seed_curriculum(conn, new_id)
+        seed_progress(conn, new_id)
+        return conn.execute("SELECT * FROM users WHERE id = ?", (new_id,)).fetchone()
 
 
-# ───────────────────────────────────────────────
-# SESSIONS (AI Memory)
-# ───────────────────────────────────────────────
-
-def create_session(user_id: int, topic: str = "Introduction to Python") -> int:
-    """Start a new session. Messages start as empty list []."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO sessions (user_id, topic, messages) VALUES (?, ?, ?)",
-        (user_id, topic, json.dumps([]))
-    )
-    session_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return session_id
+def seed_curriculum(conn: sqlite3.Connection, user_id: int) -> None:
+    for i, topic in enumerate(DEFAULT_CURRICULUM):
+        state = "active" if i == 0 else "locked"
+        conn.execute(
+            "INSERT INTO curriculum (user_id, topic_name, position, state) VALUES (?, ?, ?, ?)",
+            (user_id, topic, i, state),
+        )
 
 
-def get_session(session_id: int) -> dict | None:
-    """Load a session by ID."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
-    row = cursor.fetchone()
-    conn.close()
+def seed_progress(conn: sqlite3.Connection, user_id: int) -> None:
+    for topic in DEFAULT_CURRICULUM:
+        conn.execute(
+            "INSERT INTO progress (user_id, topic_name, status, score, last_updated) "
+            "VALUES (?, ?, 'not_started', 0, ?)",
+            (user_id, topic, _now()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
+
+def get_latest_session(user_id: int) -> Optional[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM sessions WHERE user_id = ? ORDER BY last_active DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+
+
+def create_session(user_id: int, topic: Optional[str] = None) -> sqlite3.Row:
+    with get_conn() as conn:
+        now = _now()
+        cur = conn.execute(
+            "INSERT INTO sessions (user_id, topic, messages, started_at, last_active) "
+            "VALUES (?, ?, '[]', ?, ?)",
+            (user_id, topic, now, now),
+        )
+        return conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+
+
+def get_session(session_id: int) -> Optional[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+
+
+def load_messages(session_id: int) -> List[Dict[str, Any]]:
+    row = get_session(session_id)
     if not row:
-        return None
-    session = dict(row)
-    session["messages"] = json.loads(session["messages"])  # Deserialize JSON
-    return session
+        return []
+    try:
+        return json.loads(row["messages"])
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
-def get_last_session(user_id: int) -> dict | None:
-    """Get the most recent session for a user (for resume on startup)."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT * FROM sessions WHERE user_id = ? ORDER BY last_active DESC LIMIT 1",
-        (user_id,)
-    )
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
-        return None
-    session = dict(row)
-    session["messages"] = json.loads(session["messages"])
-    return session
+def save_messages(session_id: int, messages: List[Dict[str, Any]], topic: Optional[str] = None) -> None:
+    with get_conn() as conn:
+        if topic is not None:
+            conn.execute(
+                "UPDATE sessions SET messages = ?, last_active = ?, topic = ? WHERE id = ?",
+                (json.dumps(messages), _now(), topic, session_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE sessions SET messages = ?, last_active = ? WHERE id = ?",
+                (json.dumps(messages), _now(), session_id),
+            )
 
 
-def append_message(session_id: int, role: str, content: str):
-    """
-    Add a message to the session history.
-    Role is 'user' or 'assistant'.
-    Also updates last_active timestamp.
-    """
-    session = get_session(session_id)
-    if not session:
-        raise ValueError(f"Session {session_id} not found")
+# ---------------------------------------------------------------------------
+# Progress
+# ---------------------------------------------------------------------------
 
-    messages = session["messages"]
-    messages.append({"role": role, "content": content})
-
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE sessions SET messages = ?, last_active = CURRENT_TIMESTAMP WHERE id = ?",
-        (json.dumps(messages), session_id)
-    )
-    conn.commit()
-    conn.close()
+def get_progress(user_id: int) -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT topic_name, status, score, last_updated FROM progress WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
-# ───────────────────────────────────────────────
-# PROGRESS
-# ───────────────────────────────────────────────
+def upsert_progress(user_id: int, topic: str, score: int) -> None:
+    status = "completed" if score >= 80 else ("in_progress" if score > 0 else "not_started")
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO progress (user_id, topic_name, status, score, last_updated)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, topic_name) DO UPDATE SET
+                status = excluded.status,
+                score = excluded.score,
+                last_updated = excluded.last_updated
+            """,
+            (user_id, topic, status, score, _now()),
+        )
+        # Unlock the next curriculum topic once this one is completed.
+        if status == "completed":
+            conn.execute(
+                "UPDATE curriculum SET state = 'done' WHERE user_id = ? AND topic_name = ?",
+                (user_id, topic),
+            )
+            next_locked = conn.execute(
+                "SELECT id FROM curriculum WHERE user_id = ? AND state = 'locked' "
+                "ORDER BY position LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if next_locked:
+                conn.execute(
+                    "UPDATE curriculum SET state = 'active' WHERE id = ?",
+                    (next_locked["id"],),
+                )
 
-def update_progress(user_id: int, topic_name: str, status: str, score: int = 0):
-    """Upsert progress: insert if new, update if exists."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO progress (user_id, topic_name, status, score, last_updated)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id, topic_name) DO UPDATE SET
-            status = excluded.status,
-            score = excluded.score,
-            last_updated = CURRENT_TIMESTAMP
-    """, (user_id, topic_name, status, score))
-    conn.commit()
-    conn.close()
+
+# ---------------------------------------------------------------------------
+# Curriculum
+# ---------------------------------------------------------------------------
+
+def get_curriculum(user_id: int) -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT topic_name, position, state FROM curriculum WHERE user_id = ? ORDER BY position",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
-def get_progress(user_id: int) -> list[dict]:
-    """Get all progress records for a user."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM progress WHERE user_id = ?", (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-
-# ───────────────────────────────────────────────
-# BOOTSTRAP
-# ───────────────────────────────────────────────
-
-if __name__ == "__main__":
-    init_db()
-    # Quick test
-    uid = create_user("Alice")
-    print(f"Created user: {uid}")
-    sid = create_session(uid, "Variables and Data Types")
-    print(f"Created session: {sid}")
-    append_message(sid, "user", "What is a variable?")
-    append_message(sid, "assistant", "A variable is a named container for data.")
-    session = get_session(sid)
-    print(f"Session has {len(session['messages'])} messages")
-    print(f"Last session topic: {get_last_session(uid)['topic']}")
-'''
-
-with open("pytutor/backend/database.py", "w") as f:
-    f.write(db_code)
-
-print("✅ database.py written")
-print(f"Size: {len(db_code)} characters")
+def apply_curriculum_update(user_id: int, add_topic: Optional[str], remove_topic: Optional[str],
+                             reorder: Optional[List[str]]) -> None:
+    with get_conn() as conn:
+        if remove_topic:
+            conn.execute(
+                "DELETE FROM curriculum WHERE user_id = ? AND topic_name = ?",
+                (user_id, remove_topic),
+            )
+        if add_topic:
+            existing = conn.execute(
+                "SELECT 1 FROM curriculum WHERE user_id = ? AND topic_name = ?",
+                (user_id, add_topic),
+            ).fetchone()
+            if not existing:
+                max_pos = conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) AS m FROM curriculum WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()["m"]
+                conn.execute(
+                    "INSERT INTO curriculum (user_id, topic_name, position, state) VALUES (?, ?, ?, 'locked')",
+                    (user_id, add_topic, max_pos + 1),
+                )
+        if reorder:
+            for i, topic in enumerate(reorder):
+                conn.execute(
+                    "UPDATE curriculum SET position = ? WHERE user_id = ? AND topic_name = ?",
+                    (i, user_id, topic),
+                )

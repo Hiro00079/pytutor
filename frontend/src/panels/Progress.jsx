@@ -1,95 +1,88 @@
+import React from "react";
 
-progress_jsx = """export default function Progress({ progress }) {
-  const completed = progress.filter((p) => p.status === "completed").length;
-  const inProgress = progress.filter((p) => p.status === "in_progress").length;
-  const total = 10; // Default curriculum size
-  const percent = Math.round((completed / total) * 100);
-
-  // Calculate ring circumference for SVG progress ring
-  const radius = 36;
-  const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (percent / 100) * circumference;
-
+function ProgressRing({ percent }) {
+  const r = 38;
+  const c = 2 * Math.PI * r;
+  const offset = c - (percent / 100) * c;
   return (
-    <div className="flex flex-col h-full bg-white border-t border-slate-200">
-      <div className="px-4 py-2 bg-slate-50 border-b border-slate-200">
-        <h2 className="text-sm font-semibold text-slate-700">Progress</h2>
-      </div>
-
-      <div className="flex-1 p-4 space-y-4 overflow-y-auto">
-        {/* Progress Ring */}
-        <div className="flex flex-col items-center">
-          <div className="relative w-24 h-24">
-            <svg className="w-full h-full -rotate-90" viewBox="0 0 100 100">
-              <circle
-                cx="50"
-                cy="50"
-                r={radius}
-                fill="none"
-                stroke="#e2e8f0"
-                strokeWidth="8"
-              />
-              <circle
-                cx="50"
-                cy="50"
-                r={radius}
-                fill="none"
-                stroke="#3b82f6"
-                strokeWidth="8"
-                strokeLinecap="round"
-                strokeDasharray={circumference}
-                strokeDashoffset={strokeDashoffset}
-                className="transition-all duration-700 ease-out"
-              />
-            </svg>
-            <div className="absolute inset-0 flex items-center justify-center">
-              <span className="text-lg font-bold text-slate-700">{percent}%</span>
-            </div>
-          </div>
-          <p className="text-xs text-slate-500 mt-2">{completed} of {total} topics completed</p>
-        </div>
-
-        {/* Stats */}
-        <div className="grid grid-cols-2 gap-2">
-          <div className="bg-blue-50 rounded-lg p-3 text-center">
-            <p className="text-lg font-bold text-blue-600">{inProgress}</p>
-            <p className="text-xs text-blue-500">In Progress</p>
-          </div>
-          <div className="bg-green-50 rounded-lg p-3 text-center">
-            <p className="text-lg font-bold text-green-600">{completed}</p>
-            <p className="text-xs text-green-500">Completed</p>
-          </div>
-        </div>
-
-        {/* Skill Bars */}
-        {progress.length > 0 && (
-          <div className="space-y-2">
-            <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Skills</h3>
-            {progress.map((p, i) => (
-              <div key={i}>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-600">{p.topic_name}</span>
-                  <span className="text-slate-500">{p.score}%</span>
-                </div>
-                <div className="w-full bg-slate-100 rounded-full h-2">
-                  <div
-                    className={`h-2 rounded-full transition-all duration-500 ${
-                      p.status === "completed" ? "bg-green-500" : "bg-blue-500"
-                    }`}
-                    style={{ width: `${p.score}%` }}
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
+    <svg viewBox="0 0 96 96" className="h-24 w-24 shrink-0">
+      <circle cx="48" cy="48" r={r} fill="none" stroke="#262B35" strokeWidth="8" />
+      <circle
+        cx="48"
+        cy="48"
+        r={r}
+        fill="none"
+        stroke="url(#ringGradient)"
+        strokeWidth="8"
+        strokeLinecap="round"
+        strokeDasharray={c}
+        strokeDashoffset={offset}
+        transform="rotate(-90 48 48)"
+      />
+      <defs>
+        <linearGradient id="ringGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#F0A84B" />
+          <stop offset="100%" stopColor="#4FD1AE" />
+        </linearGradient>
+      </defs>
+      <text x="48" y="53" textAnchor="middle" className="fill-ink font-display text-[20px] font-semibold">
+        {percent}%
+      </text>
+    </svg>
   );
 }
-"""
 
-with open("pytutor/frontend/src/panels/Progress.jsx", "w") as f:
-    f.write(progress_jsx)
+export default function Progress({ progress, curriculum, panelActive }) {
+  const total = progress.length || 1;
+  const completed = progress.filter((p) => p.status === "completed").length;
+  const percent = Math.round((completed / total) * 100);
+  const exercisesAttempted = progress.filter((p) => p.score > 0).length;
 
-print("✅ Progress.jsx written")
+  const nextTopic = curriculum.find((t) => t.state === "active")?.topic_name
+    || curriculum.find((t) => t.state === "locked")?.topic_name;
+
+  const sorted = [...progress].sort((a, b) => {
+    const order = curriculum.map((c) => c.topic_name);
+    return order.indexOf(a.topic_name) - order.indexOf(b.topic_name);
+  });
+
+  return (
+    <section className={`relative flex flex-col overflow-hidden bg-panel ${panelActive ? "panel-active" : ""}`}>
+      <div className="border-b border-hairline px-4 py-2.5">
+        <h2 className="font-display text-xs font-semibold uppercase tracking-wider text-mute">Progress</h2>
+      </div>
+
+      <div className="scrollbar-thin flex-1 overflow-y-auto px-4 py-4">
+        <div className="flex items-center gap-4">
+          <ProgressRing percent={percent} />
+          <div className="space-y-1">
+            <p className="text-sm text-ink">
+              <span className="font-display font-semibold">{completed}</span> of {total} topics complete
+            </p>
+            <p className="font-mono text-[11px] text-mute">{exercisesAttempted} exercises attempted</p>
+            {nextTopic && (
+              <p className="font-mono text-[11px] text-amber">next up — {nextTopic}</p>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-5 space-y-2.5">
+          {sorted.map((p) => (
+            <div key={p.topic_name}>
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-xs text-ink">{p.topic_name}</span>
+                <span className="font-mono text-[10px] text-mute">{p.score}</span>
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-hairline">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-amber to-teal transition-all"
+                  style={{ width: `${p.score}%` }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}

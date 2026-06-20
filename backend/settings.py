@@ -1,62 +1,92 @@
+"""Read/write data/settings.json — the only place API keys live.
 
-settings_code = '''"""
-settings.py — Read/write local settings.json
-
-Security principle: Keys are stored locally in a JSON file.
-They are NEVER sent to any server except the chosen AI provider.
+Keys never touch the database and are never logged. /settings/load
+returns a masked copy so the frontend can show "sk-ant-...wxyz" style
+placeholders without re-exposing the real secret.
 """
+from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
+from typing import Any, Dict
 
-SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+SETTINGS_PATH = DATA_DIR / "settings.json"
 
-DEFAULT_SETTINGS = {
+DEFAULT_SETTINGS: Dict[str, Any] = {
     "provider": "claude",
-    "api_key": "",
-    "model": "claude-sonnet-4-6",
-    "local_url": "http://localhost:11434",
+    "claude": {"api_key": "", "model": "claude-sonnet-4-6"},
+    "openai": {"api_key": "", "model": "gpt-4o"},
+    "gemini": {"api_key": "", "model": "gemini-1.5-pro"},
+    "nvidia": {"api_key": "", "model": "meta/llama-3.1-70b-instruct"},
+    "local": {"base_url": "http://localhost:11434", "model": "llama3.1"},
 }
 
+_KEY_FIELDS = {"claude", "openai", "gemini", "nvidia"}  # providers that hold api_key
 
-def load_settings() -> dict:
-    """Load settings from settings.json. Create with defaults if missing."""
+
+def _mask(key: str) -> str:
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}{'*' * (len(key) - 8)}{key[-4:]}"
+
+
+def load_settings() -> Dict[str, Any]:
+    """Load raw settings (including real keys) for internal use by ai_provider."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not SETTINGS_PATH.exists():
-        save_settings(DEFAULT_SETTINGS)
-        return DEFAULT_SETTINGS.copy()
-    
-    with open(SETTINGS_PATH, "r") as f:
-        settings = json.load(f)
-    
-    # Merge with defaults in case new fields were added since last save
-    merged = DEFAULT_SETTINGS.copy()
-    merged.update(settings)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_SETTINGS, f, indent=2)
+        return copy.deepcopy(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        data = copy.deepcopy(DEFAULT_SETTINGS)
+    # Backfill any missing keys from defaults (e.g. after a schema change)
+    merged = copy.deepcopy(DEFAULT_SETTINGS)
+    for k, v in data.items():
+        if isinstance(v, dict) and k in merged:
+            merged[k].update(v)
+        else:
+            merged[k] = v
     return merged
 
 
-def save_settings(settings: dict):
-    """Save settings to settings.json."""
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(SETTINGS_PATH, "w") as f:
-        json.dump(settings, f, indent=2)
+def load_settings_masked() -> Dict[str, Any]:
+    """Load settings safe to send to the frontend (keys masked, not removed)."""
+    data = copy.deepcopy(load_settings())
+    for provider in _KEY_FIELDS:
+        if data.get(provider, {}).get("api_key"):
+            data[provider]["api_key"] = _mask(data[provider]["api_key"])
+    return data
 
 
-def mask_settings() -> dict:
-    """
-    Return settings with API key masked (for display in frontend).
-    Shows only first 4 and last 4 chars, e.g., "sk-a...bcde"
-    """
-    settings = load_settings()
-    masked = settings.copy()
-    key = masked.get("api_key", "")
-    if len(key) > 8:
-        masked["api_key"] = key[:4] + "..." + key[-4:]
-    elif key:
-        masked["api_key"] = "****"
-    return masked
-'''
-
-with open("pytutor/backend/settings.py", "w") as f:
-    f.write(settings_code)
-
-print("✅ settings.py written")
+def save_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist settings to disk. Preserves existing keys for providers that
+    weren't part of this save (so switching providers in the UI doesn't
+    wipe out keys you'd already saved for the others)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    current = load_settings()
+    merged = copy.deepcopy(current)
+    for k, v in payload.items():
+        if isinstance(v, dict) and k in merged and isinstance(merged[k], dict):
+            for sub_k, sub_v in v.items():
+                # Don't overwrite a real key with a masked placeholder coming
+                # back from the frontend (e.g. "sk-a****wxyz").
+                if sub_k == "api_key" and isinstance(sub_v, str) and "*" in sub_v:
+                    continue
+                # Don't blank out an existing value with an empty string -
+                # the frontend may submit a partial form that left a field
+                # untouched, which arrives here as "".
+                if sub_v == "" and merged[k].get(sub_k):
+                    continue
+                merged[k][sub_k] = sub_v
+        else:
+            merged[k] = v
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2)
+    return merged

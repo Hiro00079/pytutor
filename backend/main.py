@@ -1,299 +1,190 @@
-
-main_code = '''"""
-main.py — FastAPI server for PyTutor AI
-
-This is the entry point. It defines all API routes and wires together
-database, AI provider, and models.
-
-To run: uvicorn main:app --reload --port 8000
+"""FastAPI server for PyTutor AI. Run with:
+    uvicorn main:app --reload --port 8000
 """
+from __future__ import annotations
 
-import json
-import traceback
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 
+import ai_provider
 import database as db
-from ai_provider import chat
-from prompts import SYSTEM_PROMPT
+import settings as settings_store
 from models import (
-    ChatRequest, CodeRunRequest, SettingsSaveRequest,
-    StartSessionRequest, AIResponse, SessionResponse,
-    ProgressResponse, CodeRunResponse
+    AIResponse,
+    ChatRequest,
+    ChatResponse,
+    CodeRunRequest,
+    CodeRunResponse,
+    SessionStartRequest,
+    SessionStartResponse,
+    SettingsPayload,
+    SettingsTestRequest,
 )
-from settings import load_settings, save_settings, mask_settings
+from prompts import SYSTEM_PROMPT, build_context_preamble, build_turn_instruction
 
+app = FastAPI(title="PyTutor AI")
 
-# ───────────────────────────────────────────────
-# LIFESPAN: Initialize database on startup
-# ───────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Run once when server starts and once when it stops."""
-    db.init_db()
-    print("🚀 PyTutor backend ready!")
-    yield
-    print("👋 Shutting down...")
-
-
-app = FastAPI(
-    title="PyTutor AI",
-    description="AI-powered Python learning platform",
-    version="0.1.0",
-    lifespan=lifespan,
-)
-
-# Allow frontend (running on different port) to call our API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your frontend URL
-    allow_credentials=True,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ───────────────────────────────────────────────
-# SESSION ROUTES
-# ───────────────────────────────────────────────
-
-@app.post("/session/start", response_model=SessionResponse)
-async def start_session(req: StartSessionRequest):
-    """
-    Start a new session or resume the last one for this user.
-    If the user has no sessions, create one automatically.
-    """
-    user = db.get_user(req.user_id)
-    if not user:
-        # Auto-create user on first visit
-        req.user_id = db.create_user("Learner")
-    
-    last = db.get_last_session(req.user_id)
-    if last:
-        # Resume existing session
-        return SessionResponse(
-            session_id=last["id"],
-            topic=last["topic"],
-            messages=last["messages"],
-            progress=db.get_progress(req.user_id),
-        )
-    else:
-        # Create new session
-        sid = db.create_session(req.user_id, "Introduction to Python")
-        return SessionResponse(
-            session_id=sid,
-            topic="Introduction to Python",
-            messages=[],
-            progress=db.get_progress(req.user_id),
-        )
+@app.on_event("startup")
+def on_startup() -> None:
+    db.init_db()
 
 
-# ───────────────────────────────────────────────
-# CHAT ROUTE (The Core)
-# ───────────────────────────────────────────────
-
-@app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
-    """
-    The heart of PyTutor. User sends a message → we:
-    1. Load full conversation history from DB
-    2. Append the new user message
-    3. Send everything to the AI provider
-    4. Parse the AI's JSON response
-    5. Save everything back to DB
-    6. Return the structured response to frontend
-    """
-    try:
-        # 1. Load session history
-        session = db.get_session(req.session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        
-        # 2. Append user message to history
-        db.append_message(req.session_id, "user", req.message)
-        messages = session["messages"] + [{"role": "user", "content": req.message}]
-        
-        # 3. Send to AI (with full conversation history for memory)
-        ai_raw = chat(messages, SYSTEM_PROMPT)
-        
-        # 4. Parse AI response as JSON
-        try:
-            ai_data = json.loads(ai_raw)
-        except json.JSONDecodeError:
-            # AI didn't return valid JSON — wrap it in our format
-            ai_data = {
-                "message": ai_raw,
-                "action": "explain",
-            }
-        
-        # Validate against our model (catches missing required fields)
-        ai_response = AIResponse(**ai_data)
-        
-        # 5. Save AI response to session history
-        db.append_message(req.session_id, "assistant", ai_raw)
-        
-        # 6. Handle side effects: progress updates, curriculum updates
-        if ai_response.progress_update:
-            db.update_progress(
-                req.user_id,
-                ai_response.progress_update.topic,
-                "in_progress" if ai_response.progress_update.score < 100 else "completed",
-                ai_response.progress_update.score,
-            )
-        
-        return ai_response.model_dump()
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
-# ───────────────────────────────────────────────
-# CODE EXECUTION
-# ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Session
+# ---------------------------------------------------------------------------
 
-import subprocess
-import tempfile
-
-@app.post("/code/run", response_model=CodeRunResponse)
-async def run_code(req: CodeRunRequest):
-    """
-    Execute Python code safely in a sandboxed subprocess.
-    Returns stdout, stderr, and return code.
-    """
-    try:
-        # Write code to a temp file and execute with timeout
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(req.code)
-            temp_path = f.name
-        
-        result = subprocess.run(
-            ["python3", temp_path],
-            capture_output=True,
-            text=True,
-            timeout=5,  # Kill after 5 seconds to prevent infinite loops
-        )
-        
-        return CodeRunResponse(
-            stdout=result.stdout,
-            stderr=result.stderr,
-            returncode=result.returncode,
-        )
-    except subprocess.TimeoutExpired:
-        return CodeRunResponse(
-            stdout="",
-            stderr="⏱️ Code execution timed out (5 seconds). Check for infinite loops!",
-            returncode=-1,
-        )
-    except Exception as e:
-        return CodeRunResponse(
-            stdout="",
-            stderr=f"Execution error: {str(e)}",
-            returncode=-1,
-        )
-
-
-# ───────────────────────────────────────────────
-# PROGRESS & CURRICULUM
-# ───────────────────────────────────────────────
-
-@app.get("/progress/{user_id}", response_model=ProgressResponse)
-async def get_progress(user_id: int):
-    """Get all skill scores and topic completion for a user."""
-    return ProgressResponse(
-        user_id=user_id,
-        topics=db.get_progress(user_id),
+@app.post("/session/start", response_model=SessionStartResponse)
+def session_start(payload: SessionStartRequest):
+    user = db.get_or_create_user(payload.user_id, payload.name or "Learner")
+    session = db.get_latest_session(user["id"])
+    if session is None:
+        session = db.create_session(user["id"])
+    return SessionStartResponse(
+        user_id=user["id"],
+        session_id=session["id"],
+        topic=session["topic"],
+        messages=db.load_messages(session["id"]),
+        curriculum=db.get_curriculum(user["id"]),
+        progress=db.get_progress(user["id"]),
     )
 
 
+# ---------------------------------------------------------------------------
+# Chat — the core loop
+# ---------------------------------------------------------------------------
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(payload: ChatRequest):
+    session = db.get_session(payload.session_id)
+    if session is None or session["user_id"] != payload.user_id:
+        raise HTTPException(404, "Session not found for this user.")
+
+    history = db.load_messages(payload.session_id)
+    curriculum = db.get_curriculum(payload.user_id)
+    progress = db.get_progress(payload.user_id)
+
+    turn_instruction = build_turn_instruction(payload.mode, payload.code_context)
+    state_preamble = build_context_preamble(curriculum, progress, session["topic"])
+    user_content = f"{state_preamble}\n{turn_instruction}\n\nUSER_MESSAGE: {payload.message}"
+
+    messages = history + [{"role": "user", "content": user_content}]
+
+    try:
+        raw = await ai_provider.chat(messages=messages, system_prompt=SYSTEM_PROMPT)
+    except ai_provider.ProviderError as e:
+        raise HTTPException(502, str(e)) from e
+
+    try:
+        parsed = ai_provider.parse_ai_json(raw)
+        ai_resp = AIResponse(**parsed)
+    except Exception:
+        # Don't lose the user's turn even if the model misbehaved — store
+        # what we sent, surface the raw text so the UI can still show it.
+        history.append({"role": "user", "content": payload.message})
+        history.append({"role": "assistant", "content": raw})
+        db.save_messages(payload.session_id, history)
+        return ChatResponse(ai=AIResponse(message=raw, action="explain"), raw=raw)
+
+    # Persist conversation (store the clean user message, not the
+    # instruction-wrapped one, so history stays human-readable on resume).
+    history.append({"role": "user", "content": payload.message})
+    history.append({"role": "assistant", "content": ai_resp.model_dump_json()})
+    new_topic = ai_resp.progress_update.topic if ai_resp.progress_update else session["topic"]
+    db.save_messages(payload.session_id, history, topic=new_topic)
+
+    if ai_resp.curriculum_update:
+        cu = ai_resp.curriculum_update
+        db.apply_curriculum_update(payload.user_id, cu.add_topic, cu.remove_topic, cu.reorder)
+
+    if ai_resp.progress_update:
+        db.upsert_progress(payload.user_id, ai_resp.progress_update.topic, ai_resp.progress_update.score)
+
+    return ChatResponse(ai=ai_resp)
+
+
+# ---------------------------------------------------------------------------
+# Progress / curriculum
+# ---------------------------------------------------------------------------
+
+@app.get("/progress/{user_id}")
+def get_progress(user_id: int):
+    return {"progress": db.get_progress(user_id)}
+
+
 @app.get("/curriculum/{user_id}")
-async def get_curriculum(user_id: int):
-    """
-    Get current curriculum. For now, returns a default curriculum.
-    In the future, this could be AI-generated per user.
-    """
-    # Default Python curriculum for intermediate learners
-    default_curriculum = [
-        {"name": "Variables & Data Types", "status": "not_started"},
-        {"name": "Control Flow (if/else)", "status": "not_started"},
-        {"name": "Loops (for/while)", "status": "not_started"},
-        {"name": "Functions & Scope", "status": "not_started"},
-        {"name": "Lists & Dictionaries", "status": "not_started"},
-        {"name": "File I/O", "status": "not_started"},
-        {"name": "Error Handling", "status": "not_started"},
-        {"name": "Object-Oriented Programming", "status": "not_started"},
-        {"name": "Modules & Packages", "status": "not_started"},
-        {"name": "Decorators & Generators", "status": "not_started"},
-    ]
-    
-    # Merge with user's actual progress
-    progress = db.get_progress(user_id)
-    progress_map = {p["topic_name"]: p["status"] for p in progress}
-    
-    for topic in default_curriculum:
-        if topic["name"] in progress_map:
-            topic["status"] = progress_map[topic["name"]]
-    
-    return {"user_id": user_id, "topics": default_curriculum}
+def get_curriculum(user_id: int):
+    return {"curriculum": db.get_curriculum(user_id)}
 
 
-# ───────────────────────────────────────────────
-# SETTINGS ROUTES
-# ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Code execution
+# ---------------------------------------------------------------------------
+# NOTE: this runs the user's Python locally on the machine hosting the
+# backend, the same trust model as a local Jupyter kernel. It's fine for
+# a single-user local app; it is NOT safe to expose this server to the
+# open internet as-is. The frontend can alternatively run code fully
+# client-side via Pyodide (see frontend/README note) and skip this route.
 
-@app.post("/settings/save")
-async def save_settings_endpoint(req: SettingsSaveRequest):
-    """Save provider + API key to local settings.json."""
-    settings = {
-        "provider": req.provider,
-        "api_key": req.api_key,
-        "model": req.model,
-        "local_url": req.local_url,
-    }
-    save_settings(settings)
-    return {"status": "saved"}
+@app.post("/code/run", response_model=CodeRunResponse)
+def code_run(payload: CodeRunRequest):
+    with tempfile.TemporaryDirectory() as tmp:
+        script_path = Path(tmp) / "snippet.py"
+        script_path.write_text(payload.code)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_path)],
+                capture_output=True,
+                text=True,
+                timeout=payload.timeout_seconds,
+                cwd=tmp,
+            )
+            return CodeRunResponse(
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.returncode,
+            )
+        except subprocess.TimeoutExpired as e:
+            return CodeRunResponse(
+                stdout=e.stdout or "",
+                stderr=(e.stderr or "") + f"\n[Timed out after {payload.timeout_seconds}s]",
+                timed_out=True,
+            )
 
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
 
 @app.get("/settings/load")
-async def load_settings_endpoint():
-    """Load current settings with API key masked."""
-    return mask_settings()
+def settings_load():
+    return settings_store.load_settings_masked()
+
+
+@app.post("/settings/save")
+def settings_save(payload: SettingsPayload):
+    saved = settings_store.save_settings(payload.model_dump())
+    masked = settings_store.load_settings_masked()
+    return masked
 
 
 @app.post("/settings/test")
-async def test_settings():
-    """
-    Test if the current API key works by sending a small request.
-    Returns success/fail message.
-    """
-    try:
-        # Send a minimal test message
-        test_response = chat(
-            [{"role": "user", "content": "Say 'OK' and nothing else."}],
-            "You are a test assistant."
-        )
-        if "OK" in test_response or "ok" in test_response.lower():
-            return {"status": "success", "message": "Connection successful!"}
-        return {"status": "success", "message": f"Response: {test_response[:50]}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-# ───────────────────────────────────────────────
-# HEALTH CHECK
-# ───────────────────────────────────────────────
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "pytutor-backend"}
-'''
-
-with open("pytutor/backend/main.py", "w") as f:
-    f.write(main_code)
-
-print("✅ main.py written")
-print(f"Size: {len(main_code)} characters")
+async def settings_test(payload: SettingsTestRequest):
+    return await ai_provider.test_provider(payload.provider)

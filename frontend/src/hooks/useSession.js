@@ -1,117 +1,92 @@
+import { useCallback, useEffect, useState } from "react";
+import * as api from "../api.js";
 
-use_session_js = """import { useState, useEffect, useCallback } from "react";
-import { startSession, sendChat as apiSendChat, runCode as apiRunCode } from "./api";
-
-// useSession — Manages the entire learning session state
-// Pattern: Custom Hook — extracts complex state logic into a reusable function
+const USER_ID_KEY = "pytutor.userId";
 
 export function useSession() {
-  const [userId, setUserId] = useState(1);       // Default user (will auto-create)
+  const [userId, setUserId] = useState(null);
   const [sessionId, setSessionId] = useState(null);
-  const [topic, setTopic] = useState("");
-  const [messages, setMessages] = useState([]);   // Full conversation history
-  const [loading, setLoading] = useState(false);
-  const [code, setCode] = useState("");           // Monaco editor content
-  const [output, setOutput] = useState("");       // Code execution output
-  const [quiz, setQuiz] = useState(null);         // Current quiz (if any)
-  const [progress, setProgress] = useState([]);   // Skill tracking
-  const [curriculum, setCurriculum] = useState([]); // Topic list
-  const [aiResponse, setAiResponse] = useState(null); // Last parsed AI response
+  const [topic, setTopic] = useState(null);
+  const [messages, setMessages] = useState([]); // [{role, content}] content is raw string for user, AIResponse-shaped obj for assistant
+  const [curriculum, setCurriculum] = useState([]);
+  const [progress, setProgress] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState(null);
+  const [lastEditorCode, setLastEditorCode] = useState("# Your code will appear here\n");
+  const [lastQuiz, setLastQuiz] = useState(null);
+  const [highlightLines, setHighlightLines] = useState([]);
 
-  // Initialize: resume or create session on mount
-  useEffect(() => {
-    async function init() {
-      try {
-        const session = await startSession(userId);
-        setSessionId(session.session_id);
-        setTopic(session.topic);
-        setMessages(session.messages);
-        setProgress(session.progress || []);
-      } catch (err) {
-        console.error("Failed to start session:", err);
-      }
-    }
-    init();
-  }, [userId]);
-
-  // Send a message to the AI
-  const sendChat = useCallback(
-    async (text) => {
-      if (!sessionId || !text.trim()) return;
-      setLoading(true);
-      setQuiz(null); // Clear previous quiz
-
-      try {
-        // Optimistically add user message to UI
-        const userMsg = { role: "user", content: text };
-        setMessages((prev) => [...prev, userMsg]);
-
-        // Call backend
-        const res = await apiSendChat(userId, sessionId, text);
-        setAiResponse(res);
-
-        // Add AI message to history
-        const aiMsg = { role: "assistant", content: res.message || "" };
-        setMessages((prev) => [...prev, aiMsg]);
-
-        // Handle AI actions
-        if (res.code) setCode(res.code);
-        if (res.quiz) setQuiz(res.quiz);
-        if (res.progress_update) {
-          setProgress((prev) => {
-            const existing = prev.find((p) => p.topic_name === res.progress_update.topic);
-            if (existing) {
-              return prev.map((p) =>
-                p.topic_name === res.progress_update.topic
-                  ? { ...p, score: res.progress_update.score, status: res.progress_update.score >= 100 ? "completed" : "in_progress" }
-                  : p
-              );
-            }
-            return [...prev, { topic_name: res.progress_update.topic, score: res.progress_update.score, status: "in_progress" }];
-          });
-        }
-
-        return res;
-      } catch (err) {
-        console.error("Chat error:", err);
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: `Error: ${err.message}` },
-        ]);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [userId, sessionId]
-  );
-
-  // Run code in the editor
-  const runCode = useCallback(async () => {
-    if (!code.trim()) return;
-    setOutput("Running...");
+  const init = useCallback(async () => {
+    setLoading(true);
+    setError(null);
     try {
-      const res = await apiRunCode(code);
-      const out = res.stdout + (res.stderr ? `\\n[STDERR]\\n${res.stderr}` : "");
-      setOutput(out || "(no output)");
-    } catch (err) {
-      setOutput(`Error: ${err.message}`);
+      const storedId = localStorage.getItem(USER_ID_KEY);
+      const data = await api.startSession({
+        userId: storedId ? Number(storedId) : null,
+        name: "Learner",
+      });
+      localStorage.setItem(USER_ID_KEY, String(data.user_id));
+      setUserId(data.user_id);
+      setSessionId(data.session_id);
+      setTopic(data.topic);
+      setCurriculum(data.curriculum);
+      setProgress(data.progress);
+
+      const parsedMessages = data.messages.map((m) => {
+        if (m.role === "assistant") {
+          try {
+            return { role: "assistant", content: JSON.parse(m.content) };
+          } catch {
+            return { role: "assistant", content: { message: m.content, action: "explain" } };
+          }
+        }
+        return m;
+      });
+      setMessages(parsedMessages);
+      const lastAssistant = [...parsedMessages].reverse().find((m) => m.role === "assistant");
+      if (lastAssistant?.content?.code) setLastEditorCode(lastAssistant.content.code);
+    } catch (e) {
+      setError(e.message || "Couldn't reach the PyTutor backend. Is it running on :8000?");
+    } finally {
+      setLoading(false);
     }
-  }, [code]);
+  }, []);
 
-  // Submit quiz answer
-  const submitQuiz = useCallback(
-    async (answer) => {
-      if (!quiz) return;
-      const isCorrect = answer === quiz.correct;
-      const feedback = isCorrect
-        ? `Correct! ${quiz.explanation}`
-        : `Not quite. The correct answer was ${quiz.correct}. ${quiz.explanation}`;
+  useEffect(() => {
+    init();
+  }, [init]);
 
-      // Send feedback to AI so it knows the result
-      await sendChat(`I answered "${answer}". ${feedback}`);
-      setQuiz(null);
+  const refreshProgressAndCurriculum = useCallback(async (uid) => {
+    const [p, c] = await Promise.all([api.getProgress(uid), api.getCurriculum(uid)]);
+    setProgress(p.progress);
+    setCurriculum(c.curriculum);
+  }, []);
+
+  const sendMessage = useCallback(
+    async (message, mode = "TEACH", codeContext = null) => {
+      if (!userId || !sessionId || !message.trim()) return;
+      setSending(true);
+      setError(null);
+      setMessages((prev) => [...prev, { role: "user", content: message }]);
+      try {
+        const data = await api.sendChat({ userId, sessionId, message, mode, codeContext });
+        const ai = data.ai;
+        setMessages((prev) => [...prev, { role: "assistant", content: ai }]);
+        if (ai.code) setLastEditorCode(ai.code);
+        if (ai.quiz) setLastQuiz(ai.quiz);
+        if (ai.highlight_lines?.length) setHighlightLines(ai.highlight_lines);
+        if (ai.curriculum_update || ai.progress_update) {
+          await refreshProgressAndCurriculum(userId);
+        }
+        return ai;
+      } catch (e) {
+        setError(e.message || "The tutor didn't respond. Check your provider settings.");
+      } finally {
+        setSending(false);
+      }
     },
-    [quiz, sendChat]
+    [userId, sessionId, refreshProgressAndCurriculum]
   );
 
   return {
@@ -119,23 +94,18 @@ export function useSession() {
     sessionId,
     topic,
     messages,
-    loading,
-    code,
-    setCode,
-    output,
-    quiz,
-    progress,
     curriculum,
-    aiResponse,
-    sendChat,
-    runCode,
-    submitQuiz,
-    setCurriculum,
+    progress,
+    loading,
+    sending,
+    error,
+    setError,
+    lastEditorCode,
+    setLastEditorCode,
+    lastQuiz,
+    setLastQuiz,
+    highlightLines,
+    sendMessage,
+    refreshProgressAndCurriculum,
   };
 }
-"""
-
-with open("pytutor/frontend/src/hooks/useSession.js", "w") as f:
-    f.write(use_session_js)
-
-print("✅ useSession.js written")

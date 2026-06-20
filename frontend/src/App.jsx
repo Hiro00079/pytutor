@@ -54,7 +54,7 @@ export default function App() {
     <div className="flex h-screen flex-col bg-void">
       <Header topic={session.topic} provider={provider} onOpenSettings={() => setSettingsOpen(true)} />
 
-      <main className="grid min-h-0 flex-1 grid-cols-2 grid-rows-2">
+      <main className="grid min-h-0 flex-1 grid-cols-2 grid-rows-[1fr_200px]">
         <TeachingPanel
           messages={session.messages}
           sending={session.sending}

@@ -1,0 +1,179 @@
+
+teaching_panel_jsx = """import { useRef, useEffect } from "react";
+
+export default function TeachingPanel({ messages, topic, loading, onSend }) {
+  const bottomRef = useRef(null);
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
+  return (
+    <div className="flex flex-col h-full bg-slate-50 border-r border-slate-200">
+      {/* Header */}
+      <div className="px-4 py-3 bg-white border-b border-slate-200 flex items-center justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-slate-700">Teaching</h2>
+          <p className="text-xs text-slate-500">{topic || "Loading..."}</p>
+        </div>
+        {loading && (
+          <span className="text-xs text-blue-500 animate-pulse">AI is thinking...</span>
+        )}
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {messages.length === 0 && (
+          <div className="text-center text-slate-400 mt-10">
+            <p className="text-sm">Welcome to PyTutor AI!</p>
+            <p className="text-xs mt-1">Ask a question or say "start" to begin.</p>
+          </div>
+        )}
+
+        {messages.map((msg, i) => (
+          <div
+            key={i}
+            className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+          >
+            <div
+              className={`max-w-[85%] rounded-lg px-3 py-2 text-sm ${
+                msg.role === "user"
+                  ? "bg-blue-500 text-white rounded-br-none"
+                  : "bg-white border border-slate-200 text-slate-700 rounded-bl-none shadow-sm"
+              }`}
+            >
+              {msg.content}
+            </div>
+          </div>
+        ))}
+
+        {loading && (
+          <div className="flex justify-start">
+            <div className="bg-white border border-slate-200 rounded-lg rounded-bl-none px-3 py-2 shadow-sm">
+              <div className="flex gap-1">
+                <span className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div ref={bottomRef} />
+      </div>
+
+      {/* Input */}
+      <div className="p-3 bg-white border-t border-slate-200">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            const input = e.target.elements.msg;
+            if (input.value.trim()) {
+              onSend(input.value.trim());
+              input.value = "";
+            }
+          }}
+          className="flex gap-2"
+        >
+          <input
+            name="msg"
+            type="text"
+            placeholder="Ask a question..."
+            className="flex-1 px-3 py-2 text-sm border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            disabled={loading}
+          />
+          <button
+            type="submit"
+            disabled={loading}
+            className="px-4 py-2 bg-blue-500 text-white text-sm font-medium rounded-md hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            Send
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+"""
+
+with open("pytutor/frontend/src/panels/TeachingPanel.jsx", "w") as f:
+    f.write(teaching_panel_jsx)
+
+print("✅ TeachingPanel.jsx written")
+
+
+
+codespace_jsx = """import { useEffect, useRef } from "react";
+
+export default function Codespace({ code, setCode, output, onRun, highlightLines = [] }) {
+  const editorRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  // Simple textarea-based editor (Monaco requires build tooling, we'll use this for now)
+  // In production, you'd swap this for @monaco-editor/react
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.value = code;
+    }
+  }, [code]);
+
+  return (
+    <div className="flex flex-col h-full bg-white border-l border-slate-200">
+      {/* Toolbar */}
+      <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-slate-700">Codespace</h2>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setCode("")}
+            className="px-3 py-1 text-xs text-slate-600 hover:text-slate-800 border border-slate-300 rounded hover:bg-slate-100 transition-colors"
+          >
+            Clear
+          </button>
+          <button
+            onClick={onRun}
+            className="px-3 py-1 text-xs bg-green-500 text-white rounded hover:bg-green-600 transition-colors font-medium"
+          >
+            Run ▶
+          </button>
+        </div>
+      </div>
+
+      {/* Editor */}
+      <div className="flex-1 relative">
+        <textarea
+          ref={textareaRef}
+          defaultValue={code}
+          onChange={(e) => setCode(e.target.value)}
+          className="w-full h-full p-4 font-mono text-sm text-slate-800 bg-white resize-none focus:outline-none leading-relaxed"
+          spellCheck={false}
+          placeholder="# Python code will appear here..."
+        />
+      </div>
+
+      {/* Output Panel */}
+      <div className="h-1/3 border-t border-slate-200 flex flex-col">
+        <div className="px-4 py-1 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+          <span className="text-xs font-semibold text-slate-600">Output</span>
+          {output && (
+            <button
+              onClick={() => setCode("")}
+              className="text-xs text-slate-400 hover:text-slate-600"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <pre className="flex-1 p-3 overflow-auto font-mono text-xs text-slate-700 bg-slate-50">
+          {output || "Click Run to execute code..."}
+        </pre>
+      </div>
+    </div>
+  );
+}
+"""
+
+with open("pytutor/frontend/src/panels/Codespace.jsx", "w") as f:
+    f.write(codespace_jsx)
+
+print("✅ Codespace.jsx written")
